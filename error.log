@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "C:\Users\wangyu\voice-input\voice_input.py", line 907, in <module>
+    main()
+  File "C:\Users\wangyu\voice-input\voice_input.py", line 902, in main
+    app = VoiceInputApp()
+          ^^^^^^^^^^^^^^^
+  File "C:\Users\wangyu\voice-input\voice_input.py", line 440, in __init__
+    self._build_gui()
+  File "C:\Users\wangyu\voice-input\voice_input.py", line 473, in _build_gui
+    self.root = tk.Tk()
+                ^^
+NameError: name 'tk' is not defined

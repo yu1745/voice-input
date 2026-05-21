@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+voice_input.log
+config.json
