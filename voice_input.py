@@ -1,12 +1,9 @@
 """
-豆包 Seed ASR 语音输入法
+豆包 Seed ASR 语音输入法 (Streaming)
 ========================
 按下快捷键开始录音，松手自动识别并输入文本
 
-使用前需在火山引擎控制台 (https://console.volcengine.com/doubao/voice) 创建应用获取:
-  - APP ID (app_key)
-  - Access Token (access_key)
-  (Resource ID 已内置为 volc.bigasr.sauc.duration)
+流式识别: 说话时实时显示识别结果在屏幕中央悬浮窗
 """
 
 import asyncio
@@ -19,15 +16,19 @@ import queue
 import os
 import time
 import logging
+import signal as _signal
 import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Callable
 
 import numpy as np
 import sounddevice as sd
 import pyperclip
+
+import ctypes
+import ctypes.wintypes as wintypes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,7 +42,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 BITS = 16
 DTYPE = np.int16
-FRAME_DURATION_MS = 200  # 200ms per WebSocket audio packet
+FRAME_DURATION_MS = 200  # 200ms per audio packet (optimal for streaming)
 
 # ── WebSocket binary protocol constants ──
 FULL_CLIENT_REQUEST = 0b0001
@@ -59,7 +60,8 @@ SERIALIZATION_JSON = 0b0001
 COMPRESSION_NONE = 0b0000
 COMPRESSION_GZIP = 0b0001
 
-WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream"
+# Streaming endpoint (双向流式模式)
+WS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
 RESOURCE_ID = "volc.seedasr.sauc.duration"
 
 # ── Config path ──
@@ -79,31 +81,391 @@ HOTKEY_DISPLAY_NAMES = {
 
 
 # ══════════════════════════════════════════════
+#  Win32 floating overlay (no Tkinter)
+# ══════════════════════════════════════════════
+
+user32 = ctypes.windll.user32
+gdi32 = ctypes.windll.gdi32
+kernel32 = ctypes.windll.kernel32
+
+# Set proper argument/return types for Win32 APIs to avoid overflow on x64
+user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.DefWindowProcW.restype = ctypes.c_int64
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
+user32.UpdateWindow.argtypes = [wintypes.HWND]
+user32.UpdateWindow.restype = wintypes.BOOL
+user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
+user32.InvalidateRect.restype = wintypes.BOOL
+user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.c_void_p]
+user32.GetClientRect.restype = wintypes.BOOL
+user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
+user32.BeginPaint.restype = wintypes.HDC
+user32.EndPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
+user32.EndPaint.restype = wintypes.BOOL
+user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF, ctypes.c_byte, wintypes.DWORD]
+user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+user32.DrawTextW.argtypes = [wintypes.HDC, ctypes.c_wchar_p, ctypes.c_int, ctypes.c_void_p, wintypes.UINT]
+user32.DrawTextW.restype = ctypes.c_int
+user32.FillRect.argtypes = [wintypes.HDC, ctypes.c_void_p, wintypes.HANDLE]
+user32.FillRect.restype = ctypes.c_int
+user32.DestroyWindow.argtypes = [wintypes.HWND]
+user32.DestroyWindow.restype = wintypes.BOOL
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
+user32.CreateWindowExW.argtypes = [wintypes.DWORD, ctypes.c_wchar_p, ctypes.c_wchar_p,
+                                    wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int,
+                                    wintypes.HWND, wintypes.HANDLE,
+                                    wintypes.HINSTANCE, ctypes.c_void_p]
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.RegisterClassExW.argtypes = [ctypes.c_void_p]
+user32.RegisterClassExW.restype = ctypes.c_ushort
+
+gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+gdi32.CreateCompatibleDC.restype = wintypes.HDC
+gdi32.DeleteDC.argtypes = [wintypes.HDC]
+gdi32.DeleteDC.restype = wintypes.BOOL
+gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.CreateCompatibleBitmap.restype = wintypes.HANDLE
+gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HANDLE]
+gdi32.SelectObject.restype = wintypes.HANDLE
+gdi32.DeleteObject.argtypes = [wintypes.HANDLE]
+gdi32.DeleteObject.restype = wintypes.BOOL
+gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                          wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+gdi32.BitBlt.restype = wintypes.BOOL
+gdi32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
+gdi32.CreateSolidBrush.restype = wintypes.HANDLE
+gdi32.GetStockObject.argtypes = [ctypes.c_int]
+gdi32.GetStockObject.restype = wintypes.HANDLE
+gdi32.CreateFontW.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                               wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                               wintypes.DWORD, ctypes.c_wchar_p]
+gdi32.CreateFontW.restype = wintypes.HANDLE
+gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.COLORREF]
+gdi32.SetTextColor.restype = wintypes.COLORREF
+gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
+gdi32.SetBkMode.restype = ctypes.c_int
+gdi32.RoundRect.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                             ctypes.c_int, ctypes.c_int]
+gdi32.RoundRect.restype = wintypes.BOOL
+
+# Window styles
+WS_EX_LAYERED = 0x80000
+WS_EX_TRANSPARENT = 0x20
+WS_EX_TOPMOST = 0x8
+WS_EX_TOOLWINDOW = 0x80
+WS_EX_NOACTIVATE = 0x08000000
+WS_POPUP = 0x80000000
+SW_SHOW = 5
+SW_HIDE = 0
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+WM_PAINT = 0x000F
+WM_ERASEBKGND = 0x0014
+WM_DESTROY = 0x0002
+TRANSPARENT = 1
+FW_BOLD = 700
+ANTIALIASED_QUALITY = 4
+DEFAULT_CHARSET = 1
+OUT_DEFAULT_PRECIS = 0
+CLIP_DEFAULT_PRECIS = 0
+PROOF_QUALITY = 2
+FF_DONTCARE = 0
+DEFAULT_PITCH = 0
+SRCCOPY = 0x00CC0020
+LWA_COLORKEY = 0x00000001
+LWA_ALPHA = 0x00000002
+NULL_BRUSH = 5
+
+# DrawText format constants
+DT_CENTER = 0x00000001
+DT_WORDBREAK = 0x00000010
+DT_SINGLELINE = 0x00000020
+DT_NOCLIP = 0x00000100
+DT_CALCRECT = 0x00000400
+
+# Chroma key color (RGB) — fuchsia will be transparent
+CHROMA_KEY_RGB = 0x00FF00FF  # GDI: 0x00BBGGRR
+
+# Overlay colors (BGR for GDI)
+BG_BGR = 0x00222222  # dark background
+TEXT_BGR = 0x00FFFFFF  # white
+
+WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_int64 if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long,
+    wintypes.HWND, wintypes.UINT,
+    wintypes.WPARAM, wintypes.LPARAM)
+
+
+class RECT(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("hdc", wintypes.HDC),
+        ("fErase", wintypes.BOOL),
+        ("rcPaint", RECT),
+        ("fRestore", wintypes.BOOL),
+        ("fIncUpdate", wintypes.BOOL),
+        ("rgbReserved", ctypes.c_byte * 32),
+    ]
+
+
+class WNDCLASSEX(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HANDLE),      # HCURSOR = HANDLE
+        ("hbrBackground", wintypes.HANDLE),  # HBRUSH = HANDLE
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+        ("hIconSm", wintypes.HICON),
+    ]
+
+
+# Global registry of overlay instances for window proc dispatch
+_overlay_registry: dict[int, 'FloatingOverlay'] = {}
+
+
+def _overlay_wnd_proc(hwnd, msg, wparam, lparam):
+    overlay = _overlay_registry.get(hwnd)
+    if overlay:
+        return overlay._handle_message(msg, wparam, lparam)
+    return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+_wnd_proc_cb = WNDPROC(_overlay_wnd_proc)
+
+
+class FloatingOverlay:
+    """Screen-centered transparent text overlay using Win32 chroma-key.
+
+    Appears as a floating overlay on top of all windows.
+    Entirely transparent except for the rendered text area.
+    Does NOT use Tkinter — pure Win32 API via ctypes.
+    """
+
+    def __init__(self):
+        self.hwnd = None
+        self._text = ""
+        self._visible = False
+        self._setup_window()
+
+    def _setup_window(self):
+        instance = kernel32.GetModuleHandleW(None)
+        class_name = "VoiceInputOverlay_v2"
+
+        wc = WNDCLASSEX()
+        wc.cbSize = ctypes.sizeof(WNDCLASSEX)
+        wc.style = 0
+        wc.lpfnWndProc = _wnd_proc_cb
+        wc.cbClsExtra = 0
+        wc.cbWndExtra = 0
+        wc.hInstance = instance
+        wc.hIcon = None
+        wc.hCursor = None
+        wc.hbrBackground = None
+        wc.lpszMenuName = None
+        wc.lpszClassName = class_name
+        wc.hIconSm = None
+
+        atom = user32.RegisterClassExW(ctypes.byref(wc))
+        if atom == 0:
+            # Class may already be registered
+            pass
+
+        screen_w = user32.GetSystemMetrics(0)
+        screen_h = user32.GetSystemMetrics(1)
+
+        self.hwnd = user32.CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST
+            | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class_name, "",
+            WS_POPUP,
+            0, 0, screen_w, screen_h,
+            None, None, instance, None
+        )
+
+        if not self.hwnd:
+            log.error(f"Failed to create overlay window: {ctypes.GetLastError()}")
+            return
+
+        # Chroma key: fuchsia (B,G,R) = (255, 0, 255) → transparent
+        # Global alpha: 230/255 (90% opacity for non-keyed areas)
+        user32.SetLayeredWindowAttributes(self.hwnd, CHROMA_KEY_RGB, 230,
+                                          LWA_COLORKEY | LWA_ALPHA)
+
+        _overlay_registry[self.hwnd] = self
+
+    def _handle_message(self, msg, wparam, lparam):
+        if msg == WM_PAINT:
+            self._on_paint()
+            return 0
+        elif msg == WM_ERASEBKGND:
+            return 1
+        elif msg == WM_DESTROY:
+            _overlay_registry.pop(self.hwnd, None)
+            return 0
+        return user32.DefWindowProcW(self.hwnd, msg, wparam, lparam)
+
+    def _on_paint(self):
+        ps = PAINTSTRUCT()
+        hdc = user32.BeginPaint(self.hwnd, ctypes.byref(ps))
+        if not hdc:
+            return
+
+        try:
+            rect = RECT()
+            user32.GetClientRect(self.hwnd, ctypes.byref(rect))
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+
+            # Double buffer to avoid flicker
+            hdc_mem = gdi32.CreateCompatibleDC(hdc)
+            hbitmap = gdi32.CreateCompatibleBitmap(hdc, w, h)
+            old_bitmap = gdi32.SelectObject(hdc_mem, hbitmap)
+
+            # Fill entire surface with chroma key (transparent)
+            chroma_brush = gdi32.CreateSolidBrush(CHROMA_KEY_RGB)
+            user32.FillRect(hdc_mem, ctypes.byref(rect), chroma_brush)
+            gdi32.DeleteObject(chroma_brush)
+
+            if self._text:
+                self._draw_text(hdc_mem, w, h)
+
+            # Blit to window
+            gdi32.BitBlt(hdc, 0, 0, w, h, hdc_mem, 0, 0, SRCCOPY)
+
+            gdi32.SelectObject(hdc_mem, old_bitmap)
+            gdi32.DeleteObject(hbitmap)
+            gdi32.DeleteDC(hdc_mem)
+        finally:
+            user32.EndPaint(self.hwnd, ctypes.byref(ps))
+
+    def _draw_text(self, hdc, screen_w, screen_h):
+        """Render centered text with dark background bubble."""
+        name = "Microsoft YaHei"
+        font_size = 40
+
+        hfont = gdi32.CreateFontW(
+            font_size, 0, 0, 0, FW_BOLD, False, False, False,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, name
+        )
+        if not hfont:
+            return
+        old_font = gdi32.SelectObject(hdc, hfont)
+
+        # Measure text with word wrap
+        max_text_w = min(screen_w - 160, 1200)
+        text_rect = RECT(0, 0, max_text_w, 0)
+        user32.DrawTextW(hdc, self._text, -1, ctypes.byref(text_rect),
+                         DT_CALCRECT | DT_WORDBREAK)
+
+        text_w = text_rect.right - text_rect.left
+        text_h = text_rect.bottom - text_rect.top
+
+        margin_x = 50
+        margin_y = 30
+        bg_w = text_w + margin_x * 2
+        bg_h = text_h + margin_y * 2 + 10
+
+        # Center on screen
+        bg_left = (screen_w - bg_w) // 2
+        bg_top = (screen_h - bg_h) // 2
+        bg_right = bg_left + bg_w
+        bg_bottom = bg_top + bg_h
+
+        # Draw rounded rect background
+        bg_brush = gdi32.CreateSolidBrush(BG_BGR)
+        null_pen = gdi32.GetStockObject(NULL_BRUSH)
+        old_pen = gdi32.SelectObject(hdc, null_pen)
+        old_brush = gdi32.SelectObject(hdc, bg_brush)
+
+        radius = 20
+        gdi32.RoundRect(hdc, bg_left, bg_top, bg_right, bg_bottom, radius * 2, radius * 2)
+
+        gdi32.SelectObject(hdc, old_brush)
+        gdi32.DeleteObject(bg_brush)
+        gdi32.SelectObject(hdc, old_pen)
+
+        # Draw text centered in background
+        gdi32.SetTextColor(hdc, TEXT_BGR)
+        gdi32.SetBkMode(hdc, TRANSPARENT)
+
+        text_rect.left = bg_left + margin_x
+        text_rect.top = bg_top + margin_y + 5
+        text_rect.right = bg_right - margin_x
+        text_rect.bottom = bg_bottom - margin_y - 5
+
+        user32.DrawTextW(hdc, self._text, -1, ctypes.byref(text_rect),
+                         DT_WORDBREAK | DT_CENTER | DT_NOCLIP)
+
+        gdi32.SelectObject(hdc, old_font)
+        gdi32.DeleteObject(hfont)
+
+    def show(self, text=""):
+        """Show the overlay with optional initial text."""
+        if not self.hwnd:
+            return
+        self._text = text
+        user32.ShowWindow(self.hwnd, SW_SHOW)
+        self._redraw()
+        self._visible = True
+
+    def update(self, text: str):
+        """Update displayed text on the overlay."""
+        if not self.hwnd or not self._visible:
+            return
+        self._text = text
+        self._redraw()
+
+    def hide(self):
+        """Hide the overlay."""
+        if not self.hwnd:
+            return
+        self._visible = False
+        user32.ShowWindow(self.hwnd, SW_HIDE)
+
+    def _redraw(self):
+        user32.InvalidateRect(self.hwnd, None, True)
+        user32.UpdateWindow(self.hwnd)
+
+    def destroy(self):
+        if self.hwnd:
+            _overlay_registry.pop(self.hwnd, None)
+            user32.DestroyWindow(self.hwnd)
+            self.hwnd = None
+
+
+# ══════════════════════════════════════════════
 #  Protocol helpers
 # ══════════════════════════════════════════════
 
 def make_header(msg_type: int, flags: int = FLAG_POS_SEQUENCE,
                 serialization: int = SERIALIZATION_JSON,
                 compression: int = COMPRESSION_GZIP) -> bytes:
-    """Build the 4-byte WebSocket binary protocol header.
-
-    Byte 0: [7:4] protocol version=1, [3:0] header size=1 (4 bytes)
-    Byte 1: [7:4] message type, [3:0] flags
-    Byte 2: [7:4] serialization, [3:0] compression
-    Byte 3: reserved = 0
-    """
     return struct.pack(
         "!BBBB",
-        (0b0001 << 4) | 0b0001,        # version=1, header_size=1
-        (msg_type << 4) | flags,        # type + flags
-        (serialization << 4) | compression,  # serialization + compression
+        (0b0001 << 4) | 0b0001,
+        (msg_type << 4) | flags,
+        (serialization << 4) | compression,
         0x00,
     )
 
 
 def pack_full_client_request(params: dict, seq: int = 1) -> bytes:
-    """Pack a FullClientRequest with gzip-compressed JSON payload.
-    Matches official demo: signed int seq, JSON+GZIP serialization."""
     payload = gzip.compress(json.dumps(params, ensure_ascii=False).encode("utf-8"))
     header = make_header(FULL_CLIENT_REQUEST, FLAG_POS_SEQUENCE,
                          SERIALIZATION_JSON, COMPRESSION_GZIP)
@@ -111,8 +473,6 @@ def pack_full_client_request(params: dict, seq: int = 1) -> bytes:
 
 
 def pack_audio_chunk(pcm_data: bytes, seq: int, is_last: bool = False) -> bytes:
-    """Pack an AudioOnlyRequest with gzip-compressed PCM payload.
-    Matches official demo: JSON+GZIP serialization for all messages."""
     payload = gzip.compress(pcm_data)
     flags = FLAG_NEG_SEQUENCE if is_last else FLAG_POS_SEQUENCE
     header = make_header(AUDIO_ONLY_REQUEST, flags,
@@ -122,9 +482,6 @@ def pack_audio_chunk(pcm_data: bytes, seq: int, is_last: bool = False) -> bytes:
 
 
 def parse_response(data: bytes) -> tuple[Optional[dict], bool]:
-    """Parse a binary WebSocket response (matches official demo format).
-    Returns (parsed_dict, is_final) or (error_dict, True) on error.
-    """
     if len(data) < 4:
         return None, True
 
@@ -134,14 +491,11 @@ def parse_response(data: bytes) -> tuple[Optional[dict], bool]:
     compression = header[2] & 0x0f
 
     offset = 4
-    # flags & 0x01 → has sequence number
     if flags & 0x01:
         offset += 4
-    # flags & 0x04 → has event/code field before payload
     if flags & 0x04:
         offset += 4
 
-    # Error message format
     if msg_type == ERROR_TYPE:
         code = struct.unpack(">i", data[offset:offset + 4])[0]
         payload_size = struct.unpack(">I", data[offset + 4:offset + 8])[0]
@@ -161,7 +515,6 @@ def parse_response(data: bytes) -> tuple[Optional[dict], bool]:
     try:
         if compression == COMPRESSION_GZIP:
             raw = gzip.decompress(raw)
-        # Strip any non-JSON prefix
         start = raw.find(b'{')
         if start > 0:
             raw = raw[start:]
@@ -173,23 +526,33 @@ def parse_response(data: bytes) -> tuple[Optional[dict], bool]:
 
 
 # ══════════════════════════════════════════════
-#  Audio recorder
+#  Audio recorder with streaming callback support
 # ══════════════════════════════════════════════
 
 class AudioRecorder:
-    """Records PCM audio from microphone into a thread-safe buffer."""
+    """Records PCM audio from microphone.
+
+    Supports two modes:
+    - Streaming: provide chunk_callback, called with each chunk
+    - Buffered: no callback, use stop() to get all audio
+    """
 
     def __init__(self):
         self._buffer: list[np.ndarray] = []
         self._stream: Optional[sd.InputStream] = None
         self._recording = False
         self._lock = threading.Lock()
+        self._chunk_callback: Optional[Callable[[bytes], None]] = None
+        self._total_bytes = 0
 
     @property
     def is_recording(self) -> bool:
         return self._recording
 
-    def start(self) -> None:
+    def start(self, chunk_callback: Optional[Callable[[bytes], None]] = None) -> None:
+        """Start recording. If chunk_callback is set, called with each PCM chunk."""
+        self._chunk_callback = chunk_callback
+        self._total_bytes = 0
         with self._lock:
             self._buffer.clear()
             self._recording = True
@@ -197,9 +560,15 @@ class AudioRecorder:
         def callback(indata, frames, time_info, status):
             if status:
                 log.warning(f"Audio callback status: {status}")
-            if self._recording:
+            if not self._recording:
+                return
+            data = indata.copy()
+            if self._chunk_callback:
+                self._total_bytes += len(data)
+                self._chunk_callback(data.tobytes())
+            else:
                 with self._lock:
-                    self._buffer.append(indata.copy())
+                    self._buffer.append(data)
 
         self._stream = sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -211,27 +580,39 @@ class AudioRecorder:
         self._stream.start()
         log.info("Recording started")
 
-    def stop(self) -> Optional[bytes]:
-        """Stop recording and return concatenated PCM bytes, or None if empty."""
+    def stop(self) -> tuple[Optional[bytes], int]:
+        """Stop recording.
+
+        Returns:
+            (pcm_bytes_or_None, total_bytes_recorded)
+            In streaming mode, pcm_bytes is None (audio already streamed via callback).
+            In buffered mode, pcm_bytes is the complete audio.
+        """
         self._recording = False
         if self._stream:
             self._stream.stop()
             self._stream.close()
             self._stream = None
 
+        total = self._total_bytes
+
+        if self._chunk_callback:
+            log.info(f"Recording stopped: {total} bytes streamed ({total / (SAMPLE_RATE * 2):.1f}s)")
+            return None, total
+
         with self._lock:
             if not self._buffer:
                 log.info("No audio recorded")
-                return None
+                return None, 0
             audio = np.concatenate(self._buffer, axis=0).tobytes()
-            duration = len(audio) / (SAMPLE_RATE * 2)  # 16-bit = 2 bytes per sample
+            duration = len(audio) / (SAMPLE_RATE * 2)
             log.info(f"Recording stopped: {len(self._buffer)} chunks, "
                      f"{len(audio)} bytes ({duration:.1f}s)")
-            return audio
+            return audio, len(audio)
 
 
 # ══════════════════════════════════════════════
-#  Seed ASR WebSocket client
+#  ASR Config
 # ══════════════════════════════════════════════
 
 @dataclass
@@ -243,102 +624,176 @@ class ASRConfig:
         return bool(self.app_id and self.access_key)
 
 
-class SeedASRClient:
-    """WebSocket client for 火山引擎 Seed ASR (流式输入模式)."""
+# ══════════════════════════════════════════════
+#  Streaming Seed ASR WebSocket client
+# ══════════════════════════════════════════════
 
-    def __init__(self, config: ASRConfig):
+class StreamASRClient:
+    """Streaming WebSocket client for Doubao Seed ASR.
+
+    Sends audio chunks as they arrive via push_audio() (thread-safe).
+    Returns partial results via on_partial and final result via on_final.
+    """
+
+    def __init__(self, config: ASRConfig,
+                 on_partial: Optional[Callable[[str], None]] = None,
+                 on_final: Optional[Callable[[str], None]] = None):
         self.config = config
+        self.on_partial = on_partial
+        self.on_final = on_final
+        self._audio_queue: queue.Queue = queue.Queue()
+        self._last_text = ""
+        self._done = threading.Event()
 
-    async def transcribe(self, pcm_data: bytes) -> str:
-        """Send PCM audio and return transcribed text."""
+    def push_audio(self, chunk: bytes, is_last: bool = False):
+        """Push an audio chunk for transmission. Thread-safe."""
+        self._audio_queue.put((chunk, is_last))
+        if is_last:
+            log.info("Last audio chunk enqueued")
+
+    async def start(self) -> str:
+        """Connect to the streaming endpoint and run the session.
+
+        Returns the final transcribed text.
+        """
         if not self.config.is_valid():
             raise ValueError("API credentials not configured")
 
+        req_id = str(uuid.uuid4())
         headers = {
             "X-Api-App-Key": self.config.app_id,
             "X-Api-Access-Key": self.config.access_key,
             "X-Api-Resource-Id": RESOURCE_ID,
-            "X-Api-Request-Id": str(uuid.uuid4()),
+            "X-Api-Connect-Id": req_id,
         }
 
-        log.info(f"Connecting to Seed ASR...")
+        log.info("Connecting to Seed ASR (streaming)...")
         import websockets
-        async with websockets.connect(
-            WS_URL,
-            additional_headers=list(headers.items()),
-            ping_interval=None,
-        ) as ws:
-            # ── 1. Send FullClientRequest ──
-            request_params = {
-                "user": {"uid": "voice_input"},
-                "audio": {
-                    "format": "pcm",
-                    "rate": SAMPLE_RATE,
-                    "bits": BITS,
-                    "channel": CHANNELS,
-                },
-                "request": {
-                    "model_name": "bigmodel",
-                    "enable_punc": True,
-                    "enable_itn": True,
-                    "enable_ddc": True,
-                },
-            }
-            await ws.send(pack_full_client_request(request_params, seq=1))
-            log.info("FullClientRequest sent")
+        from websockets.exceptions import InvalidStatus
 
-            # Read welcome / task-started response
-            resp = await ws.recv()
-            if isinstance(resp, bytes):
-                body, _ = parse_response(resp)
+        try:
+            async with websockets.connect(
+                WS_URL,
+                additional_headers=list(headers.items()),
+                ping_interval=None,
+            ) as ws:
+                # ── 1. Send FullClientRequest ──
+                request_params = {
+                    "user": {"uid": "voice_input"},
+                    "audio": {
+                        "format": "pcm",
+                        "rate": SAMPLE_RATE,
+                        "bits": BITS,
+                        "channel": CHANNELS,
+                    },
+                    "request": {
+                        "model_name": "bigmodel",
+                        "enable_punc": True,
+                        "enable_itn": True,
+                        "enable_ddc": True,
+                    },
+                }
+                await ws.send(pack_full_client_request(request_params, seq=1))
+                log.info("FullClientRequest sent")
+
+                # Read welcome response
+                resp = await ws.recv()
+                if isinstance(resp, bytes):
+                    body, _ = parse_response(resp)
+                    if body:
+                        log.debug(f"Server welcome received")
+
+                # ── 2. Concurrent send/recv ──
+                send_task = asyncio.create_task(self._send_loop(ws))
+                recv_task = asyncio.create_task(self._recv_loop(ws))
+
+                # Wait for recv to complete (final result received)
+                result = await recv_task
+                send_task.cancel()
+                try:
+                    await send_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+                self._last_text = result
+                self._done.set()
+                log.info(f"Streaming ASR complete: {result[:100] if result else '(empty)'}")
+                return result
+
+        except InvalidStatus as e:
+            log.error(f"HTTP {e.response.status_code}: {e.response.reason_phrase}")
+            try:
+                body = getattr(e.response, 'body', None)
                 if body:
-                    log.info(f"Server welcome: {json.dumps(body, ensure_ascii=False)[:200]}")
+                    log.error(f"Response body: {body.decode('utf-8', errors='replace')[:500]}")
+            except Exception:
+                pass
+            try:
+                log.error(f"Response headers: {dict(e.response.headers)}")
+            except Exception:
+                pass
+            self._done.set()
+            raise
+        except Exception as e:
+            log.error(f"Streaming ASR failed: {e}")
+            self._done.set()
+            raise
 
-            # ── 2. Send audio chunks ──
-            chunk_bytes = int(SAMPLE_RATE * 2 * FRAME_DURATION_MS / 1000)  # 200ms
-            total = len(pcm_data)
-            offset = 0
-            seq = 2
-
-            while offset < total:
-                chunk = pcm_data[offset:offset + chunk_bytes]
-                is_last = (offset + chunk_bytes >= total)
+    async def _send_loop(self, ws):
+        """Read from audio queue and send via WebSocket."""
+        seq = 2
+        while True:
+            # Run queue.get in executor to avoid blocking event loop
+            item = await asyncio.get_event_loop().run_in_executor(
+                None, self._audio_queue.get
+            )
+            chunk, is_last = item
+            if chunk or is_last:  # always send last packet (even empty) to signal EOF
                 await ws.send(pack_audio_chunk(chunk, seq, is_last))
                 seq += 1
-                offset += chunk_bytes
+            if is_last:
+                break
 
-            log.info(f"Sent {seq - 2} audio chunks (last={is_last})")
+    async def _recv_loop(self, ws) -> str:
+        """Receive results from WebSocket until final."""
+        full_text = ""
+        while True:
+            try:
+                message = await asyncio.wait_for(ws.recv(), timeout=30.0)
+            except asyncio.TimeoutError:
+                log.warning("Receive timeout, using last result")
+                break
+            except Exception:
+                break
 
-            # ── 3. Receive results ──
-            full_text = ""
-            while True:
+            if isinstance(message, bytes):
+                body, is_final = parse_response(message)
+                if body is None:
+                    continue
+                if body.get("error"):
+                    raise RuntimeError(body.get("message", "Unknown server error"))
                 try:
-                    message = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    log.warning("Receive timeout (30s), using last result")
-                    break
-                except websockets.exceptions.ConnectionClosed as e:
-                    log.info(f"Connection closed: {e.code}")
-                    break
-
-                if isinstance(message, bytes):
-                    body, is_final = parse_response(message)
-                    if body is None:
-                        continue
-                    if body.get("error"):
-                        raise RuntimeError(body.get("message", "Unknown server error"))
-                    try:
-                        text = body["result"]["text"]
-                    except (KeyError, TypeError):
-                        text = ""
-                    if text:
-                        full_text = text
-                        log.info(f"Received: {text[:80]}")
+                    text = body["result"]["text"]
+                except (KeyError, TypeError):
+                    text = ""
+                if text:
+                    full_text = text
+                    log.debug(f"Partial: {text[:60]}")
+                    if not is_final and self.on_partial:
+                        self.on_partial(text)
                     if is_final:
-                        log.info(f"Final result: {full_text[:100]}")
-                        break
+                        log.info(f"Final result: {text[:100]}")
+                        if self.on_final:
+                            self.on_final(text)
+                        return full_text
+        if self.on_final and full_text:
+            self.on_final(full_text)
+        return full_text
 
-            return full_text
+    def wait_result(self, timeout: float = 30.0) -> str:
+        """Block until the streaming session completes. Thread-safe."""
+        self._done.wait(timeout=timeout)
+        return self._last_text
 
 
 # ══════════════════════════════════════════════
@@ -391,7 +846,6 @@ def parse_hotkey(name: str):
     }
     if name in mapping:
         return mapping[name]
-    # Single character key
     if len(name) == 1:
         return kb.KeyCode.from_char(name)
     raise ValueError(f"Unknown hotkey: {name}")
@@ -425,8 +879,13 @@ class VoiceInputApp:
 
         # Components
         self.recorder = AudioRecorder()
-        self.asr_client = SeedASRClient(self.asr_config)
         self.async_engine = AsyncEngine()
+
+        # Streaming ASR session (created per-recording)
+        self._stream_asr: Optional[StreamASRClient] = None
+
+        # Floating overlay — pure Win32, no Tkinter
+        self.overlay = FloatingOverlay()
 
         # GUI
         self.root: Optional[tk.Tk] = None
@@ -446,7 +905,7 @@ class VoiceInputApp:
 
         # Protocol-safe shutdown
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
-        log.info("Voice Input App started")
+        log.info("Voice Input App started (streaming mode)")
 
     # ── Config persistence ──
 
@@ -517,7 +976,8 @@ class VoiceInputApp:
         hotkey_frame.pack(fill="x", pady=5)
         tk.Label(hotkey_frame, text="快捷键:", font=("Microsoft YaHei", 10),
                  bg="#f5f5f5", fg="#555").pack(side="left")
-        self._hotkey_var = tk.StringVar(value=HOTKEY_DISPLAY_NAMES.get(self.hotkey_name, self.hotkey_name.upper()))
+        self._hotkey_var = tk.StringVar(
+            value=HOTKEY_DISPLAY_NAMES.get(self.hotkey_name, self.hotkey_name.upper()))
         hotkey_label = tk.Label(hotkey_frame, textvariable=self._hotkey_var,
                                 font=("Microsoft YaHei", 12, "bold"),
                                 bg="#f5f5f5", fg="#2980b9", cursor="hand2")
@@ -554,11 +1014,9 @@ class VoiceInputApp:
         if self._status_var:
             text = self.STATES.get(state, state)
             self._status_var.set(text)
-            # Color
             colors = {"idle": "#2ecc71", "recording": "#e74c3c",
                       "transcribing": "#f39c12", "error": "#e74c3c"}
             color = colors.get(state, "#333")
-            # Find the status label (hacky but works for simple UI)
             for w in self.root.winfo_children():
                 for c in w.winfo_children():
                     if isinstance(c, tk.Label) and c.cget("textvariable") == str(self._status_var):
@@ -586,12 +1044,13 @@ class VoiceInputApp:
         from pynput import keyboard as kb
 
         self._pressed = False
-        # Stop current listener
         if self._pynput_listener:
-            try: self._pynput_listener.stop()
-            except Exception: pass
+            try:
+                self._pynput_listener.stop()
+            except Exception:
+                pass
 
-        captured = [None]  # mutable cell
+        captured = [None]
 
         dialog = tk.Toplevel(self.root)
         dialog.title("设置快捷键")
@@ -635,7 +1094,7 @@ class VoiceInputApp:
             if display:
                 captured[0] = name_key or display.lower()
                 key_display.config(text=display)
-            return False  # stop listener
+            return False
 
         listener = kb.Listener(on_press=on_press)
         listener.daemon = True
@@ -650,7 +1109,9 @@ class VoiceInputApp:
                 for w in self.root.winfo_children():
                     for c in w.winfo_children():
                         if isinstance(c, tk.Label) and "按住" in c.cget("text"):
-                            c.configure(text=f"按住 {HOTKEY_DISPLAY_NAMES.get(captured[0], captured[0].upper())} 开始录音\n松开自动识别并输入")
+                            c.configure(
+                                text=f"按住 {HOTKEY_DISPLAY_NAMES.get(captured[0], captured[0].upper())} 开始录音\n"
+                                     f"松开自动识别并输入")
                 self._save_config()
             self._start_hotkey_listener()
 
@@ -673,7 +1134,7 @@ class VoiceInputApp:
     def _open_settings(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("设置")
-        dialog.geometry("420x370")
+        dialog.geometry("460x420")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
@@ -684,58 +1145,70 @@ class VoiceInputApp:
 
         row = 0
 
-        # App ID
-        tk.Label(frame, text="APP ID:", bg="#f5f5f5", font=("Microsoft YaHei", 10),
-                 anchor="w").grid(row=row, column=0, sticky="w", pady=5)
-        app_id_entry = tk.Entry(frame, width=35, font=("Consolas", 10))
+        # ── Section: API 凭证 ──
+        api_header = tk.Label(frame, text="🔑 API 凭证", font=("Microsoft YaHei", 11, "bold"),
+                              bg="#f5f5f5", fg="#2c3e50", anchor="w")
+        api_header.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        row += 1
+
+        # APP ID (row with label above)
+        tk.Label(frame, text="APP ID（应用ID）", bg="#f5f5f5",
+                 font=("Microsoft YaHei", 9), fg="#555", anchor="w").grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        app_id_entry = tk.Entry(frame, width=40, font=("Consolas", 10))
         app_id_entry.insert(0, self.asr_config.app_id)
-        app_id_entry.grid(row=row, column=0, columnspan=2, pady=2, sticky="ew")
+        app_id_entry.grid(row=row, column=0, columnspan=2, pady=(0, 8), sticky="ew")
         row += 1
 
-        # Access Key
-        tk.Label(frame, text="Access Token:", bg="#f5f5f5", font=("Microsoft YaHei", 10),
-                 anchor="w").grid(row=row, column=0, sticky="w", pady=5)
-        access_key_entry = tk.Entry(frame, width=35, font=("Consolas", 10), show="*")
+        # Access Token
+        tk.Label(frame, text="Access Token（访问令牌）", bg="#f5f5f5",
+                 font=("Microsoft YaHei", 9), fg="#555", anchor="w").grid(
+            row=row, column=0, columnspan=2, sticky="w")
+        row += 1
+        access_key_entry = tk.Entry(frame, width=40, font=("Consolas", 10))
         access_key_entry.insert(0, self.asr_config.access_key)
-        access_key_entry.grid(row=row, column=0, columnspan=2, pady=2, sticky="ew")
+        access_key_entry.grid(row=row, column=0, columnspan=2, pady=(0, 5), sticky="ew")
         row += 1
 
-        # ── Separator ──
-        tk.Frame(frame, bg="#ddd", height=1).grid(row=row, column=0, columnspan=2,
-                                                    sticky="ew", pady=10)
-        row += 1
-
-        # Hotkey
-        tk.Label(frame, text="快捷键:", bg="#f5f5f5", font=("Microsoft YaHei", 10),
-                 anchor="w").grid(row=row, column=0, sticky="w", pady=5)
-        hotkey_var = tk.StringVar(value=self.hotkey_name)
-        hotkey_opts = ["f1", "f2", "f3", "f4", "f5", "f6",
-                       "f7", "f8", "f9", "f10", "f11", "f12"]
-        hotkey_menu = ttk.Combobox(frame, textvariable=hotkey_var, values=hotkey_opts,
-                                    width=10, state="readonly", font=("Consolas", 10))
-        hotkey_menu.grid(row=row, column=0, padx=(0, 10), sticky="w")
+        # Hint: source
+        source_hint = tk.Label(frame,
+                               text="从火山引擎控制台 → 豆包语音 → 流式语音识别模型2.0 获取",
+                               font=("Microsoft YaHei", 8), bg="#f5f5f5", fg="#999",
+                               anchor="w", justify="left")
+        source_hint.grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 5))
         row += 1
 
         # Separator
         tk.Frame(frame, bg="#ddd", height=1).grid(row=row, column=0, columnspan=2,
-                                                    sticky="ew", pady=10)
+                                                    sticky="ew", pady=8)
         row += 1
 
-        # ── Hint ──
-        hint = tk.Text(frame, height=3, width=40, bg="#fef9e7", fg="#7f6000",
-                       font=("Microsoft YaHei", 8), border=0, wrap="word")
-        hint.insert("1.0",
-                    "获取 API 凭证:\n"
-                    "1. 打开 https://console.volcengine.com/doubao/voice\n"
-                    "2. 创建应用 → 获取 APP ID 和 Access Token\n"
-                    "3. 保存后即可使用 (Resource ID 已内置)")
-        hint.config(state="disabled")
-        hint.grid(row=row, column=0, columnspan=2, pady=5, sticky="ew")
+        # ── Section: 快捷键 ──
+        hotkey_header = tk.Label(frame, text="⌨️ 快捷键", font=("Microsoft YaHei", 11, "bold"),
+                                 bg="#f5f5f5", fg="#2c3e50", anchor="w")
+        hotkey_header.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         row += 1
 
-        # ── Buttons ──
+        hotkey_var = tk.StringVar(value=self.hotkey_name)
+        hotkey_opts = ["f1", "f2", "f3", "f4", "f5", "f6",
+                       "f7", "f8", "f9", "f10", "f11", "f12"]
+        tk.Label(frame, text="录音快捷键:", bg="#f5f5f5",
+                 font=("Microsoft YaHei", 9), fg="#555").grid(
+            row=row, column=0, sticky="w")
+        hotkey_menu = ttk.Combobox(frame, textvariable=hotkey_var, values=hotkey_opts,
+                                    width=8, state="readonly", font=("Consolas", 10))
+        hotkey_menu.grid(row=row, column=0, padx=(100, 0), sticky="w")
+        row += 1
+
+        # Separator
+        tk.Frame(frame, bg="#ddd", height=1).grid(row=row, column=0, columnspan=2,
+                                                    sticky="ew", pady=8)
+        row += 1
+
+        # Buttons
         btn_frame = tk.Frame(frame, bg="#f5f5f5")
-        btn_frame.grid(row=row, column=0, columnspan=2, pady=10)
+        btn_frame.grid(row=row, column=0, columnspan=2, pady=(5, 10))
 
         def save_settings():
             self.asr_config.app_id = app_id_entry.get().strip()
@@ -746,12 +1219,10 @@ class VoiceInputApp:
                 messagebox.showwarning("提示", "请填写 APP ID 和 Access Token")
                 return
 
-            # Update hotkey if changed
             if new_hotkey != self.hotkey_name:
                 self.hotkey_name = new_hotkey
                 self._hotkey_var.set(HOTKEY_DISPLAY_NAMES.get(new_hotkey, new_hotkey.upper()))
                 self._restart_hotkey_listener()
-                # Update hint text
                 for w in self.root.winfo_children():
                     for c in w.winfo_children():
                         if isinstance(c, tk.Label) and "按住" in c.cget("text"):
@@ -759,7 +1230,6 @@ class VoiceInputApp:
                                 text=f"按住 {HOTKEY_DISPLAY_NAMES.get(new_hotkey, new_hotkey.upper())} 开始录音\n"
                                      f"松开自动识别并输入")
 
-            self.asr_client = SeedASRClient(self.asr_config)
             self._save_config()
             dialog.destroy()
             messagebox.showinfo("设置已保存", "API 凭证已保存并生效")
@@ -774,11 +1244,11 @@ class VoiceInputApp:
     def _show_help(self):
         hotkey = HOTKEY_DISPLAY_NAMES.get(self.hotkey_name, self.hotkey_name.upper())
         msg = (
-            f"🎤 语音输入法 v1.0\n\n"
+            f"🎤 语音输入法 v2.0 (流式)\n\n"
             f"使用方法:\n"
-            f"  1. 按住 {hotkey} → 开始录音\n"
-            f"  2. 说话（持续按住）\n"
-            f"  3. 松开 {hotkey} → 自动识别并输入\n\n"
+            f"  1. 按住 {hotkey} → 开始录音，屏幕中央显示实时识别\n"
+            f"  2. 说话（持续按住），识别结果实时更新\n"
+            f"  3. 松开 {hotkey} → 自动输入文本\n\n"
             f"首次使用:\n"
             f"  点击「设置」填入 API 凭证\n"
             f"  凭证在火山引擎控制台获取\n\n"
@@ -789,13 +1259,11 @@ class VoiceInputApp:
         messagebox.showinfo("帮助", msg)
 
     def _test_api(self):
-        """Test the API connection with a short beep or generated tone."""
         if not self.asr_config.is_valid():
             messagebox.showwarning("提示", "请先在设置中填写 API 凭证")
             return
 
         self._set_state("transcribing")
-        # Generate a short 1-second test tone (440Hz sine wave)
         t = np.linspace(0, 1.0, int(SAMPLE_RATE * 1.0), endpoint=False)
         test_audio = (np.sin(2 * np.pi * 440 * t) * 8000).astype(np.int16).tobytes()
 
@@ -811,7 +1279,14 @@ class VoiceInputApp:
             finally:
                 self.root.after(0, lambda: self._set_state("idle"))
 
-        self.async_engine.run(self.asr_client.transcribe(test_audio), on_result)
+        # Use the non-streaming test via StreamASRClient for simplicity
+        async def test_transcribe():
+            client = StreamASRClient(self.asr_config)
+            # Push audio and signal end
+            client.push_audio(test_audio, is_last=True)
+            return await client.start()
+
+        self.async_engine.run(test_transcribe(), on_result)
 
     # ── Hotkey listener ──
 
@@ -851,53 +1326,85 @@ class VoiceInputApp:
     # ── Hotkey callbacks ──
 
     def _on_hotkey_down(self):
-        """Called when hotkey is pressed - start recording."""
+        """Hotkey pressed — show overlay, start recording + streaming ASR."""
         if not self.asr_config.is_valid():
             log.warning("Credentials not configured")
             return
         if self.state == "transcribing" or self._processing:
-            log.info("Still transcribing previous recording, ignoring hotkey press")
+            log.info("Still processing previous recording, ignoring")
             return
 
         self.root.after(0, lambda: self._set_state("recording"))
-        self.recorder.start()
+
+        # Show floating overlay (Win32, not Tkinter)
+        self.overlay.show("...")
+
+        # Create streaming ASR client with partial result callback
+        self._stream_asr = StreamASRClient(
+            self.asr_config,
+            on_partial=lambda text: self.root.after(0, lambda: self.overlay.update(text)),
+        )
+
+        # Start streaming ASR session in background
+        # Use done callback for completion (cleaner than on_final race)
+        future = self.async_engine.run(self._stream_asr.start())
+        future.add_done_callback(
+            lambda f: self.root.after(0, lambda: self._on_stream_session_end(f))
+        )
+
+        # Start recording with streaming callback → feeds audio to ASR
+        self.recorder.start(chunk_callback=self._on_audio_chunk)
+
+    def _on_audio_chunk(self, chunk_bytes: bytes):
+        """Called from audio callback (system thread) for each 200ms chunk."""
+        if self._stream_asr:
+            self._stream_asr.push_audio(chunk_bytes, is_last=False)
 
     def _on_hotkey_up(self):
-        """Called when hotkey is released - stop recording and transcribe."""
+        """Hotkey released — stop recording, send last chunk, wait for final."""
         if self.state != "recording" or self._processing:
             return
         self._processing = True
 
-        pcm_data = self.recorder.stop()
-        if pcm_data is None or len(pcm_data) < 320:  # <10ms of audio = probably accidental
+        # Stop recording (audio already streamed via callback)
+        _, total_bytes = self.recorder.stop()
+
+        if total_bytes < 320:  # <10ms = accidental press
             self._processing = False
+            self.overlay.hide()
+            self._stream_asr = None
             self.root.after(0, lambda: self._set_state("idle"))
             log.info("Audio too short, ignoring")
             return
 
+        # Signal last audio chunk — ASR will finalize
+        if self._stream_asr:
+            self._stream_asr.push_audio(b"", is_last=True)
+
         self.root.after(0, lambda: self._set_state("transcribing"))
-        self._transcribe_and_type(pcm_data)
 
-    def _transcribe_and_type(self, pcm_data: bytes):
-        """Transcribe audio and insert the result into the focused window."""
-
-        def on_result(future):
+    def _on_stream_session_end(self, future):
+        """Called on main thread (via root.after) when streaming session finishes."""
+        try:
+            text = future.result()  # may raise on error
+        except Exception as e:
+            log.error(f"ASR streaming failed: {e}")
+            self.overlay.hide()
             self._processing = False
-            try:
-                text = future.result()
-                if text:
-                    log.info(f"Transcription result: {text}")
-                    self._type_text(text)
-                    self.root.after(0, lambda: self._set_state("idle"))
-                else:
-                    self.root.after(0, lambda: self._set_state("idle"))
-            except Exception as e:
-                log.error(f"Transcription failed: {e}")
-                self._processing = False
-                self.root.after(0, lambda: self._set_state("error"))
-                self.root.after(2000, lambda: self._set_state("idle"))
+            self._stream_asr = None
+            self._set_state("error")
+            self.root.after(2000, lambda: self._set_state("idle"))
+            return
 
-        self.async_engine.run(self.asr_client.transcribe(pcm_data), on_result)
+        self.overlay.hide()
+
+        if text:
+            log.info(f"Transcription result: {text}")
+            self._type_text(text)
+
+        self._processing = False
+        self._stream_asr = None
+        self._set_state("idle")
 
     def _type_text(self, text: str):
         """Type text into the currently focused window using clipboard paste."""
@@ -910,7 +1417,6 @@ class VoiceInputApp:
             kb.press_and_release("ctrl+v")
             time.sleep(0.05)
 
-            # Restore old clipboard after a short delay (give paste time to complete)
             def restore():
                 time.sleep(0.3)
                 pyperclip.copy(old_clipboard)
@@ -935,7 +1441,6 @@ class VoiceInputApp:
             from PIL import Image, ImageDraw
             import pystray
 
-            # Create icon image
             img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
             draw = ImageDraw.Draw(img)
             draw.ellipse([8, 8, 56, 56], fill="#3498db")
@@ -965,6 +1470,7 @@ class VoiceInputApp:
     def _really_quit(self):
         """Clean shutdown."""
         log.info("Shutting down...")
+        self.overlay.destroy()
         if self._pynput_listener:
             try:
                 self._pynput_listener.stop()
@@ -979,6 +1485,7 @@ class VoiceInputApp:
 
     def run(self):
         """Run the application."""
+        _signal.signal(_signal.SIGINT, lambda sig, frame: self.root.after(0, self._really_quit))
         self.root.mainloop()
 
 
@@ -987,10 +1494,8 @@ class VoiceInputApp:
 # ══════════════════════════════════════════════
 
 def main():
-    # Suppress websocket traffic logs
     logging.getLogger("websockets").setLevel(logging.WARNING)
 
-    # Ensure asyncio policy for Windows
     if os.name == "nt":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 

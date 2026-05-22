@@ -1,4 +1,5 @@
 __pycache__/
 *.pyc
 voice_input.log
+error.log
 config.json
