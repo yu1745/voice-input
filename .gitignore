@@ -3,3 +3,7 @@ __pycache__/
 voice_input.log
 error.log
 config.json
+node_modules/
+dist/
+hw_token.json
+hw_device_id
