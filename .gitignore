@@ -12,3 +12,5 @@ sample2.wav
 *.log
 error.log
 voice_input.pid
+*.pcm
+sample*

@@ -8,6 +8,7 @@ voice_input.py — 全局快捷键语音输入（qwen3-asr-flash 批量识别）
                               录音期间流式模型(fun-asr)实时出字预览
   · 松开 Ctrl + Win         →  停止录音，整段送 qwen3-asr-flash 批量识别（全局优化），
                               最终结果粘贴到当前光标
+  · 状态错乱/卡住时再按一次  →  重置当前会话并重新开始（而不是忽略）
 
 双模型分工：
   实时预览  fun-asr-realtime（WebSocket 流式）边录边出字，仅供你看着反馈
@@ -247,12 +248,13 @@ class Controller(QObject):
     sig_show = pyqtSignal(str)
     sig_update = pyqtSignal(str)
     sig_hide = pyqtSignal()
-    sig_done = pyqtSignal(str)
-    sig_error = pyqtSignal(str)
+    sig_done = pyqtSignal(str, int)      # (text, gen)  gen=会话代号，作废过期结果用
+    sig_error = pyqtSignal(str, int)     # (msg, gen)
 
     def __init__(self, overlay):
         super().__init__()
         self.overlay = overlay; self.state = "idle"; self.rec = None; self.preview = None
+        self.gen = 0                      # 会话代号：每次重置 +1，隔离在途的旧批量识别
         self.sig_press.connect(self._do_start)
         self.sig_release.connect(self._do_stop)
         self.sig_show.connect(lambda s: self.overlay.show_at(s))
@@ -264,8 +266,32 @@ class Controller(QObject):
     def press(self):   self.sig_press.emit()      # 热键线程
     def release(self): self.sig_release.emit()
 
+    def _abort_current(self):
+        """丢弃当前会话（录音 / 实时预览 / 在途批量识别），回到 idle。"""
+        if self.preview:
+            self.preview.stop()
+            try:
+                if self.preview.ws:
+                    self.preview.ws.close()
+            except Exception:
+                pass
+            self.preview = None
+        if self.rec:
+            try:
+                self.rec.stop()
+            except Exception:
+                pass
+            self.rec = None
+        self.gen += 1                 # 在途的批量识别结果一律作废，不再落地
+        self.state = "idle"
+        self.sig_hide.emit()
+
     def _do_start(self):
-        if self.state != "idle": return
+        if self.state != "idle":
+            # 状态错乱（松开事件丢失 / 批量识别挂起）时再次按下：
+            # 重置当前会话重新开始，而不是忽略——保证快捷键永远能恢复
+            print(f"[语音输入] ↺ 按下时状态异常({self.state})，重置会话后重新开始", flush=True)
+            self._abort_current()
         self.state = "recording"
         # 开流式预览（边录边出字）
         self.preview = StreamPreview(
@@ -289,23 +315,29 @@ class Controller(QObject):
             self.state = "idle"; self.preview = None; self.sig_hide.emit(); return
         self.state = "transcribing"
         self.sig_show.emit("识别中")
-        threading.Thread(target=self._asr_thread, args=(wav,), daemon=True).start()
+        gen = self.gen
+        threading.Thread(target=self._asr_thread, args=(wav, gen), daemon=True).start()
 
-    def _asr_thread(self, wav):
+    def _asr_thread(self, wav, gen):
         try:
             # 批量模型（全局优化）——这才是最终采信的结果
-            text = transcribe(wav, lambda t: self.sig_update.emit(t))
-            self.sig_done.emit(text)
+            def _on_partial(t):
+                if gen == self.gen:
+                    self.sig_update.emit(t)
+            text = transcribe(wav, _on_partial)
+            self.sig_done.emit(text, gen)
         except Exception as e:
-            self.sig_error.emit(str(e))
+            self.sig_error.emit(str(e), gen)
 
-    def on_done(self, text):
+    def on_done(self, text, gen):
+        if gen != self.gen: return   # 会话已被重置，丢弃过期结果
         text = (text or "").strip()
         print(f"[语音输入] ✅ {text}", flush=True)
         if text: self._type(text)
         self.state = "idle"; self.sig_hide.emit()
 
-    def on_error(self, msg):
+    def on_error(self, msg, gen):
+        if gen != self.gen: return   # 会话已被重置，丢弃过期结果
         print(f"[语音输入] ❌ {msg}", flush=True)
         self.sig_update.emit(f"⚠️ {msg}")
         self.state = "idle"
