@@ -1,9 +1,14 @@
 __pycache__/
 *.pyc
-voice_input.log
-error.log
+.venv/
+venv/
+# 配置含 API Key，绝不提交
 config.json
-node_modules/
-dist/
-hw_token.json
-hw_device_id
+**/config.json
+# 测试/运行产物
+sample.wav
+sample.mp3
+sample2.wav
+*.log
+error.log
+voice_input.pid

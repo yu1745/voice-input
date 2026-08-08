@@ -1,0 +1,8 @@
+{
+  "api_key": "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "asr_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+  "model": "qwen3-asr-flash",
+  "language": "zh",
+  "gain": 4.0,
+  "region": "cn-beijing"
+}
